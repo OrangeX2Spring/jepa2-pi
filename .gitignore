@@ -1,0 +1,27 @@
+# Root-level ignores for the pi-jepa mega-repo.
+# vjepa2/ and openpi-comet/ keep their own nested .gitignore files (still respected by git).
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Large artifacts that should never live in git (cluster jobs write these)
+*.sqsh
+*.tar
+*.pt
+*.pth
+checkpoints/
+ckpt*/
+latents/
+wandb/
+
+# Cluster job logs
+*.out
+*.err

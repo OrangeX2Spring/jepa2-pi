@@ -1,0 +1,29 @@
+# Stage 1b: Train fresh AC predictor on BEHAVIOR-1K latents
+# Encoder: V-JEPA 2 ViT-L (256px, patch16, tubelet2) — frozen, latents pre-cached
+# Predictor: depth-12 / dim-384 (~70M params) — trained from scratch
+# Hardware target: single 24 GB GPU (RTX 3090 / A5000 / RTX 4090)
+
+data:
+  crop_size:    256
+  patch_size:   16
+  tubelet_size: 2
+  # action_dim and state_dim are hard-coded in train_predictor.py (23 / 23)
+  # chunk_len is also hard-coded (32) — matches π0.5-comet action_horizon
+
+model:
+  pred_depth:    12       # depth-24 is the droid config; 12 fits 24 GB with headroom
+  pred_embed_dim: 384     # vjepa2 default for ViT-L-based predictor
+  pred_num_heads: 12
+  use_rope:      true
+  use_activation_checkpointing: false   # not needed at this model size
+
+optimization:
+  epochs:       100       # adjust down (20-30) for quick iteration on 1-2 tasks
+  batch_size:   64        # keeps GPU mem ~14-16 GB; above the 12 GB kill threshold
+  lr:           4.0e-4
+  final_lr:     0.0
+  weight_decay: 0.04
+
+meta:
+  log_freq:     100       # batches between console log lines
+  save_every:   1         # save checkpoint every N epochs (1 = safest vs preemption)
