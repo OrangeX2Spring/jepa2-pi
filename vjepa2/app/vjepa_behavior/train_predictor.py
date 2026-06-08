@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import io
 import os
 import sys
 import time
@@ -89,10 +90,11 @@ def make_loader(latent_dir: str, batch_size: int, shuffle_buffer: int = 5000):
     print(f"Found {len(shards)} shards in {latent_dir}")
 
     def decode_sample(sample):
-        z_t     = torch.from_numpy(np.load(sample["z_t.npy"],    allow_pickle=False)).float()
-        z_tH    = torch.from_numpy(np.load(sample["z_tH.npy"],   allow_pickle=False)).float()
-        action  = torch.from_numpy(np.load(sample["action.npy"], allow_pickle=False)).float()
-        state   = torch.from_numpy(np.load(sample["state.npy"],  allow_pickle=False)).float()
+        # WebDataset returns raw bytes for .npy entries — must wrap in BytesIO
+        z_t    = torch.from_numpy(np.load(io.BytesIO(sample["z_t.npy"]),    allow_pickle=False)).float()
+        z_tH   = torch.from_numpy(np.load(io.BytesIO(sample["z_tH.npy"]),   allow_pickle=False)).float()
+        action = torch.from_numpy(np.load(io.BytesIO(sample["action.npy"]), allow_pickle=False)).float()
+        state  = torch.from_numpy(np.load(io.BytesIO(sample["state.npy"]),  allow_pickle=False)).float()
         return z_t, z_tH, action, state
 
     dataset = (
@@ -126,6 +128,11 @@ def forward_step(predictor, z_t, action_chunk, state_t):
     B = z_t.size(0)
     action_flat = action_chunk.reshape(B, FLAT_ACTION).unsqueeze(1)  # [B, 1, 736]
     state_in    = state_t.unsqueeze(1)                                # [B, 1, 23]
+
+    # Normalise across the feature dim to handle mixed units (velocities vs
+    # joint angles vs [0,1] gripper widths) before the linear encoders see them.
+    action_flat = F.layer_norm(action_flat, action_flat.shape[-1:])
+    state_in    = F.layer_norm(state_in,    state_in.shape[-1:])
 
     z_pred = predictor(z_t, action_flat, state_in)   # [B, 256, 1024]
     return z_pred
