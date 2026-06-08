@@ -1,29 +1,28 @@
 # Stage 1b: Train fresh AC predictor on BEHAVIOR-1K latents
-# Encoder: V-JEPA 2 ViT-L (256px, patch16, tubelet2) — frozen, latents pre-cached
-# Predictor: depth-12 / dim-384 (~70M params) — trained from scratch
-# Hardware target: single 24 GB GPU (RTX 3090 / A5000 / RTX 4090)
+# Training runs until convergence (ReduceLROnPlateau decays LR on plateau;
+# stops when LR hits min_lr). Resubmit the SLURM job as many times as needed.
 
 data:
   crop_size:    256
   patch_size:   16
   tubelet_size: 2
-  # action_dim and state_dim are hard-coded in train_predictor.py (23 / 23)
-  # chunk_len is also hard-coded (32) — matches π0.5-comet action_horizon
 
 model:
-  pred_depth:    12       # depth-24 is the droid config; 12 fits 24 GB with headroom
-  pred_embed_dim: 384     # vjepa2 default for ViT-L-based predictor
-  pred_num_heads: 12
-  use_rope:      true
-  use_activation_checkpointing: false   # not needed at this model size
+  pred_depth:              12
+  pred_embed_dim:         384
+  pred_num_heads:          12
+  use_rope:               true
+  use_activation_checkpointing: false
 
 optimization:
-  epochs:       100       # adjust down (20-30) for quick iteration on 1-2 tasks
-  batch_size:   64        # keeps GPU mem ~14-16 GB; above the 12 GB kill threshold
+  batch_size:      64       # ~14-16 GB GPU mem; above the 12 GB cluster kill threshold
   lr:           4.0e-4
-  final_lr:     0.0
-  weight_decay: 0.04
+  weight_decay:   0.04
+  lr_decay_factor: 0.5      # multiply LR by this on plateau
+  lr_patience:    1000      # steps of no improvement before LR decay
+  min_lr:       1.0e-6      # stop training when LR reaches this floor
 
 meta:
-  log_freq:     100       # batches between console log lines
-  save_every:   1         # save checkpoint every N epochs (1 = safest vs preemption)
+  log_freq:        100      # steps between loss/lr/gpu log lines
+  save_every:      500      # overwrite latest.pt every N steps
+  snapshot_every: 2000      # permanent step_XXXXXX.pt every N steps
