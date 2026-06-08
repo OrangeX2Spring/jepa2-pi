@@ -61,10 +61,12 @@ def load_encoder(ckpt_path: str, device: torch.device):
         state_dict = ckpt[state_key]
         # strip DistributedDataParallel 'module.' prefix if present
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-        encoder.load_state_dict(state_dict, strict=True)
+        # strict=False: checkpoint has pos_embed but model uses RoPE (no pos_embed key)
+        encoder.load_state_dict(state_dict, strict=False)
     else:
         print("Loading ViT-L encoder from torch.hub (requires internet)…")
-        encoder = vjepa2_vit_large(pretrained=True)
+        # vjepa2_vit_large returns (encoder, predictor) — we only need the encoder
+        encoder, _ = vjepa2_vit_large(pretrained=True)
         encoder = encoder.to(device)
 
     encoder.eval()
@@ -76,8 +78,8 @@ def load_encoder(ckpt_path: str, device: torch.device):
 
 def _build_vitl_encoder(device):
     """Instantiate ViT-L without pretrained weights (used when loading from ckpt)."""
-    encoder = vjepa2_vit_large(pretrained=False).to(device)
-    return encoder, None
+    encoder, _ = vjepa2_vit_large(pretrained=False)
+    return encoder.to(device), None
 
 
 # ------------------------------------------------------------------
