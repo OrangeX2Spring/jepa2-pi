@@ -126,12 +126,14 @@ def make_live_loader(
     video_cache_size=32,
     episode_cache_size=32,
     shuffle=True,
+    sample_stride=1,
 ):
     dataset = BehaviorDataset(data_root=data_root, camera_key=camera_key,
                                chunk_len=chunk_len, img_size=img_size,
                                max_episodes_per_task=max_episodes_per_task,
                                video_cache_size=video_cache_size,
-                               episode_cache_size=episode_cache_size)
+                               episode_cache_size=episode_cache_size,
+                               sample_stride=sample_stride)
     print(f"Live dataset: {len(dataset)} samples ({len(dataset._episodes)} episodes)")
     loader_kwargs = {
         "batch_size": batch_size,
@@ -148,14 +150,15 @@ def make_live_loader(
 def infinite_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256,
                          max_episodes_per_task=None, num_workers=4,
                          prefetch_factor=1, video_cache_size=32,
-                         episode_cache_size=32, shuffle=True):
+                         episode_cache_size=32, shuffle=True, sample_stride=1):
     loader = make_live_loader(data_root, camera_key, batch_size, chunk_len, img_size,
                               num_workers=num_workers,
                               max_episodes_per_task=max_episodes_per_task,
                               prefetch_factor=prefetch_factor,
                               video_cache_size=video_cache_size,
                               episode_cache_size=episode_cache_size,
-                              shuffle=shuffle)
+                              shuffle=shuffle,
+                              sample_stride=sample_stride)
     while True:
         for frame_t, action, state, frame_tH in loader:
             yield frame_t, frame_tH, action, state  # reorder to match (z_t, z_tH, action, state)
@@ -219,6 +222,7 @@ def train(args, cfg):
     snapshot_every = meta_cfg.get("snapshot_every", 2000)
     log_freq       = meta_cfg.get("log_freq",        100)
     min_lr         = opt_cfg.get("min_lr",           1e-6)
+    batch_size     = args.batch_size or opt_cfg["batch_size"]
 
     predictor = build_predictor(cfg, device)
     predictor.train()
@@ -248,16 +252,17 @@ def train(args, cfg):
     scaler   = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     if args.data_root:
         data_gen = infinite_live_loader(args.data_root, args.camera_key,
-                                        opt_cfg["batch_size"], CHUNK_LEN,
+                                        batch_size, CHUNK_LEN,
                                         cfg["data"]["crop_size"],
                                         max_episodes_per_task=args.max_episodes_per_task,
                                         num_workers=args.num_workers,
                                         prefetch_factor=args.prefetch_factor,
                                         video_cache_size=args.video_cache_size,
                                         episode_cache_size=args.episode_cache_size,
-                                        shuffle=args.shuffle_live)
+                                        shuffle=args.shuffle_live,
+                                        sample_stride=args.sample_stride)
     else:
-        data_gen = infinite_loader(args.latent_dir, opt_cfg["batch_size"])
+        data_gen = infinite_loader(args.latent_dir, batch_size)
     recent_losses = []
     t0 = time.time()
     step = start_step
@@ -265,20 +270,28 @@ def train(args, cfg):
     print(f"Training from step {start_step} — runs until LR reaches {min_lr:.0e}")
 
     while True:
+        step_t0 = time.time()
         z_t, z_tH, action, state = next(data_gen)
+        data_time = time.time() - step_t0
 
         if encoder is not None:
             z_t, z_tH = z_t.to(device), z_tH.to(device)
             action, state = action.to(device), state.to(device)
+            encode_t0 = time.time()
             with torch.no_grad():
                 z_t  = F.layer_norm(encode_frame(encoder, z_t,  device), [ENCODER_DIM])
                 z_tH = F.layer_norm(encode_frame(encoder, z_tH, device), [ENCODER_DIM])
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            encode_time = time.time() - encode_t0
         else:
+            encode_time = 0.0
             z_t    = z_t.to(device,    non_blocking=True)
             z_tH   = z_tH.to(device,   non_blocking=True)
             action = action.to(device, non_blocking=True)
             state  = state.to(device,  non_blocking=True)
 
+        train_t0 = time.time()
         with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
             z_pred = forward_step(predictor, z_t, action, state)
             loss   = loss_fn(z_pred, z_tH)
@@ -289,9 +302,24 @@ def train(args, cfg):
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        train_time = time.time() - train_t0
 
         recent_losses.append(loss.item())
         step += 1
+
+        if step <= start_step + 5:
+            mem = torch.cuda.max_memory_allocated(device) / 1024**2 if device.type == "cuda" else 0.0
+            print(
+                f"warmup step {step}"
+                f" | loss {loss.item():.4f}"
+                f" | data {data_time:.2f}s"
+                f" | encode {encode_time:.2f}s"
+                f" | train {train_time:.2f}s"
+                f" | GPU {mem:.0f} MB",
+                flush=True,
+            )
 
         # Log + plateau-based LR update
         if step % log_freq == 0:
@@ -345,6 +373,8 @@ def main():
     parser.add_argument("--max_episodes_per_task", type=int, default=None,
                         help="Cap episodes per task to limit dataset size and RAM. "
                              "None = use all. 200 gives ~200k samples and fast iteration.")
+    parser.add_argument("--batch_size",            type=int, default=None,
+                        help="Override optimization.batch_size from config.")
     parser.add_argument("--num_workers",           type=int, default=4,
                         help="DataLoader workers for live frame training.")
     parser.add_argument("--prefetch_factor",       type=int, default=1,
@@ -355,6 +385,8 @@ def main():
                         help="Max parquet episodes cached per worker.")
     parser.add_argument("--shuffle_live",          action=argparse.BooleanOptionalAction, default=True,
                         help="Shuffle live frame samples. Disable for low-memory sequential video reads.")
+    parser.add_argument("--sample_stride",         type=int, default=1,
+                        help="Use every Nth valid live-frame sample.")
     parser.add_argument("--ckpt_dir",   required=True)
     parser.add_argument("--config",     default="app/vjepa_behavior/configs/vitl-256-b1k.yaml")
     args = parser.parse_args()

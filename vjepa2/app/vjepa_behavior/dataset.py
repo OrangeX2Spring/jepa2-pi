@@ -67,6 +67,7 @@ class BehaviorDataset(Dataset):
         max_episodes_per_task: int = None,
         video_cache_size: int = _VR_CACHE_MAX,
         episode_cache_size: int = _EPISODE_CACHE_MAX,
+        sample_stride: int = 1,
     ):
         self.data_root  = Path(data_root)
         self.camera_key = camera_key
@@ -74,6 +75,7 @@ class BehaviorDataset(Dataset):
         self.img_size   = img_size
         self.video_cache_size = max(0, video_cache_size)
         self.episode_cache_size = max(0, episode_cache_size)
+        self.sample_stride = max(1, sample_stride)
 
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
@@ -151,7 +153,8 @@ class BehaviorDataset(Dataset):
     def _build_offsets(self):
         offsets = [0]
         for ep in self._episodes:
-            offsets.append(offsets[-1] + max(0, ep["length"] - self.chunk_len))
+            num_starts = max(0, ep["length"] - self.chunk_len)
+            offsets.append(offsets[-1] + (num_starts + self.sample_stride - 1) // self.sample_stride)
         return offsets
 
     def _lookup_index(self, idx):
@@ -161,7 +164,7 @@ class BehaviorDataset(Dataset):
             raise IndexError(idx)
 
         ep_idx = bisect_right(self._offsets, idx) - 1
-        t = idx - self._offsets[ep_idx]
+        t = (idx - self._offsets[ep_idx]) * self.sample_stride
         return ep_idx, t
 
     def _load_episode_arrays(self, ep_idx):

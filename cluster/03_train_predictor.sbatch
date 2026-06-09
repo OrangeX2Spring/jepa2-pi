@@ -50,11 +50,13 @@ podman run --rm \
         --encoder_ckpt          /mnt/projects/at3dcv/world_model/vjepa2_vitl.pt \
         --ckpt_dir              /mnt/projects/at3dcv/world_model/ckpt_predictor \
         --config                app/vjepa_behavior/configs/vitl-256-b1k.yaml \
+        --batch_size            16 \
         --max_episodes_per_task 200 \
-        --num_workers           2 \
+        --num_workers           4 \
         --prefetch_factor       1 \
         --video_cache_size      1 \
         --episode_cache_size    1 \
+        --sample_stride         8 \
         --no-shuffle_live
 
 echo "Job finished. Check /mnt/projects/at3dcv/world_model/ckpt_predictor/ for checkpoints."
