@@ -61,7 +61,7 @@ podman run --rm \
         --encoder_ckpt          /mnt/projects/at3dcv/world_model/vjepa2_vitl.pt \
         --out_dir               /tmp/latents \
         --shard_size            2000 \
-        --batch_size            128 \
+        --batch_size            512 \
         --num_workers           4 \
         --max_episodes_per_task 200 \
         --sample_stride         8
