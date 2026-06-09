@@ -46,9 +46,10 @@ podman run --rm \
     --ipc=host \
     jepa2-pi \
     python -m app.vjepa_behavior.train_predictor \
-        --data_root    /tmp/b1k_data \
-        --encoder_ckpt /mnt/projects/at3dcv/world_model/vjepa2_vitl.pt \
-        --ckpt_dir   /mnt/projects/at3dcv/world_model/ckpt_predictor \
-        --config     app/vjepa_behavior/configs/vitl-256-b1k.yaml
+        --data_root             /tmp/b1k_data \
+        --encoder_ckpt          /mnt/projects/at3dcv/world_model/vjepa2_vitl.pt \
+        --ckpt_dir              /mnt/projects/at3dcv/world_model/ckpt_predictor \
+        --config                app/vjepa_behavior/configs/vitl-256-b1k.yaml \
+        --max_episodes_per_task 200
 
 echo "Job finished. Check /mnt/projects/at3dcv/world_model/ckpt_predictor/ for checkpoints."

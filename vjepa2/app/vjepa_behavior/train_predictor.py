@@ -114,15 +114,20 @@ def infinite_loader(latent_dir: str, batch_size: int):
         yield from make_loader(latent_dir, batch_size)
 
 
-def make_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256, num_workers=4):
+def make_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256,
+                     num_workers=4, max_episodes_per_task=None):
     dataset = BehaviorDataset(data_root=data_root, camera_key=camera_key,
-                               chunk_len=chunk_len, img_size=img_size)
-    print(f"Live dataset: {len(dataset)} samples")
+                               chunk_len=chunk_len, img_size=img_size,
+                               max_episodes_per_task=max_episodes_per_task)
+    print(f"Live dataset: {len(dataset)} samples ({len(dataset._episodes)} episodes)")
     return DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                      num_workers=num_workers, pin_memory=True, drop_last=True)
+                      num_workers=num_workers, pin_memory=True, drop_last=True,
+                      persistent_workers=(num_workers > 0))
 
-def infinite_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256):
-    loader = make_live_loader(data_root, camera_key, batch_size, chunk_len, img_size)
+def infinite_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256,
+                         max_episodes_per_task=None):
+    loader = make_live_loader(data_root, camera_key, batch_size, chunk_len, img_size,
+                              max_episodes_per_task=max_episodes_per_task)
     while True:
         for frame_t, action, state, frame_tH in loader:
             yield frame_t, frame_tH, action, state  # reorder to match (z_t, z_tH, action, state)
@@ -216,7 +221,8 @@ def train(args, cfg):
     if args.data_root:
         data_gen = infinite_live_loader(args.data_root, args.camera_key,
                                         opt_cfg["batch_size"], CHUNK_LEN,
-                                        cfg["data"]["crop_size"])
+                                        cfg["data"]["crop_size"],
+                                        max_episodes_per_task=args.max_episodes_per_task)
     else:
         data_gen = infinite_loader(args.latent_dir, opt_cfg["batch_size"])
     recent_losses = []
@@ -299,10 +305,13 @@ def train(args, cfg):
 # ------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--latent_dir",   default=None)
-    parser.add_argument("--data_root",    default=None)
-    parser.add_argument("--encoder_ckpt", default="")
-    parser.add_argument("--camera_key",   default="observation.images.rgb.head")
+    parser.add_argument("--latent_dir",            default=None)
+    parser.add_argument("--data_root",             default=None)
+    parser.add_argument("--encoder_ckpt",          default="")
+    parser.add_argument("--camera_key",            default="observation.images.rgb.head")
+    parser.add_argument("--max_episodes_per_task", type=int, default=None,
+                        help="Cap episodes per task to limit dataset size and RAM. "
+                             "None = use all. 200 gives ~200k samples and fast iteration.")
     parser.add_argument("--ckpt_dir",   required=True)
     parser.add_argument("--config",     default="app/vjepa_behavior/configs/vitl-256-b1k.yaml")
     args = parser.parse_args()
