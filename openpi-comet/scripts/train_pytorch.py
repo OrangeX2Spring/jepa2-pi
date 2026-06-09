@@ -29,6 +29,7 @@ import logging
 import os
 import platform
 import shutil
+import sys
 import time
 
 import jax
@@ -36,9 +37,11 @@ import numpy as np
 import safetensors.torch
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import torch.nn.parallel
 import tqdm
 import wandb
+import yaml
 
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
@@ -155,7 +158,7 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, extra_modules=None):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
@@ -177,6 +180,10 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
 
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
+
+        if extra_modules is not None:
+            for name, module in extra_modules.items():
+                torch.save(module.state_dict(), tmp_ckpt_dir / f"{name}.pt")
 
         # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
         metadata = {
@@ -203,7 +210,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
+def load_checkpoint(model, optimizer, checkpoint_dir, device, extra_modules=None):
     """Load the latest checkpoint and return the global step."""
     checkpoint_steps = [
         int(d.name)
@@ -254,6 +261,15 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         torch.cuda.empty_cache()
         gc.collect()
         log_memory_usage(device, latest_step, "after_loading_optimizer")
+
+        if extra_modules is not None:
+            for name, module in extra_modules.items():
+                path = ckpt_dir / f"{name}.pt"
+                if path.exists():
+                    module.load_state_dict(torch.load(path, map_location=device, weights_only=False))
+                    logging.info(f"Loaded extra module {name} from {path}")
+                else:
+                    logging.warning(f"Extra module checkpoint not found: {path}")
 
         # Load metadata
         logging.info("Loading metadata...")
@@ -313,6 +329,132 @@ def log_memory_usage(device, step, phase="unknown"):
     logging.info(
         f"Step {step} ({phase}): GPU memory - allocated: {memory_allocated:.2f}GB, reserved: {memory_reserved:.2f}GB, free: {memory_free:.2f}GB, peak_allocated: {max_memory_allocated:.2f}GB, peak_reserved: {max_memory_reserved:.2f}GB{ddp_info}"
     )
+
+
+def freeze_paligemma_for_joint_training(model):
+    """Freeze the VLM backbone while leaving the action expert/projections trainable."""
+    model_to_freeze = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    for param in model_to_freeze.paligemma_with_expert.paligemma.parameters():
+        param.requires_grad_(False)
+
+    trainable = sum(p.numel() for p in model_to_freeze.parameters() if p.requires_grad)
+    frozen = sum(p.numel() for p in model_to_freeze.parameters() if not p.requires_grad)
+    logging.info(f"Frozen PaliGemma backbone for joint training: trainable={trainable:,}, frozen={frozen:,}")
+
+
+def setup_jepa_components(config: _config.TrainConfig, device: torch.device):
+    if config.jepa_loss_weight <= 0:
+        return None
+    if config.jepa_vjepa2_root is None:
+        raise ValueError("jepa_vjepa2_root must be set when jepa_loss_weight > 0")
+    if config.jepa_encoder_ckpt is None:
+        raise ValueError("jepa_encoder_ckpt must be set when jepa_loss_weight > 0")
+    if config.jepa_predictor_ckpt is None:
+        raise ValueError("jepa_predictor_ckpt must be set when jepa_loss_weight > 0")
+
+    vjepa2_root = os.path.abspath(config.jepa_vjepa2_root)
+    if vjepa2_root not in sys.path:
+        sys.path.insert(0, vjepa2_root)
+
+    from app.vjepa_behavior.encode_latents import encode_frame, load_encoder
+    from src.models.ac_predictor import vit_ac_predictor
+
+    predictor_config_path = config.jepa_predictor_config
+    if not os.path.isabs(predictor_config_path):
+        predictor_config_path = os.path.join(vjepa2_root, predictor_config_path)
+    with open(predictor_config_path) as f:
+        jepa_cfg = yaml.safe_load(f)
+
+    pred_cfg = jepa_cfg["model"]
+    predictor = vit_ac_predictor(
+        img_size=jepa_cfg["data"]["crop_size"],
+        patch_size=jepa_cfg["data"]["patch_size"],
+        num_frames=2,
+        tubelet_size=jepa_cfg["data"]["tubelet_size"],
+        embed_dim=1024,
+        predictor_embed_dim=pred_cfg["pred_embed_dim"],
+        depth=pred_cfg["pred_depth"],
+        num_heads=pred_cfg["pred_num_heads"],
+        is_frame_causal=True,
+        use_rope=pred_cfg.get("use_rope", True),
+        use_activation_checkpointing=pred_cfg.get("use_activation_checkpointing", False),
+        action_embed_dim=32 * config.jepa_action_dim,
+        state_embed_dim=256,
+        use_extrinsics=False,
+    ).to(device)
+
+    ckpt = torch.load(config.jepa_predictor_ckpt, map_location="cpu", weights_only=False)
+    predictor.load_state_dict(ckpt["predictor"] if "predictor" in ckpt else ckpt)
+    predictor.train()
+
+    encoder = load_encoder(config.jepa_encoder_ckpt, device)
+    encoder.eval()
+    for param in encoder.parameters():
+        param.requires_grad_(False)
+
+    return {
+        "predictor": predictor,
+        "encoder": encoder,
+        "encode_frame": encode_frame,
+    }
+
+
+def prepare_jepa_frames(images: torch.Tensor, device: torch.device, size: int = 256) -> torch.Tensor:
+    images = images.to(device)
+    if images.ndim == 5 and images.shape[1] == 1:
+        images = images[:, 0]
+    if images.ndim != 4:
+        raise ValueError(f"Expected JEPA images with 4 dims, got {tuple(images.shape)}")
+    if images.shape[-1] in (1, 3):
+        images = images.permute(0, 3, 1, 2)
+    images = images.to(torch.float32)
+    if images.max() > 2.0:
+        images = images / 255.0
+    elif images.min() < 0.0:
+        images = images / 2.0 + 0.5
+    if images.shape[-2:] != (size, size):
+        images = F.interpolate(images, size=(size, size), mode="bilinear", align_corners=False)
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=images.dtype, device=device)[None, :, None, None]
+    std = torch.tensor([0.229, 0.224, 0.225], dtype=images.dtype, device=device)[None, :, None, None]
+    return (images - mean) / std
+
+
+def unnormalize_actions_for_jepa(actions: torch.Tensor, data_config: _config.DataConfig, action_dim: int) -> torch.Tensor:
+    actions = actions[..., :action_dim].to(torch.float32)
+    stats = None if data_config.norm_stats is None else data_config.norm_stats.get("actions")
+    if stats is None:
+        return actions
+
+    if data_config.use_quantile_norm and stats.q01 is not None and stats.q99 is not None:
+        q01 = torch.as_tensor(stats.q01[..., :action_dim], dtype=actions.dtype, device=actions.device)
+        q99 = torch.as_tensor(stats.q99[..., :action_dim], dtype=actions.dtype, device=actions.device)
+        return (actions + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+
+    mean = torch.as_tensor(stats.mean[..., :action_dim], dtype=actions.dtype, device=actions.device)
+    std = torch.as_tensor(stats.std[..., :action_dim], dtype=actions.dtype, device=actions.device)
+    return actions * (std + 1e-6) + mean
+
+
+def compute_jepa_loss(jepa_components, jepa_batch, action_chunk, device):
+    encoder = jepa_components["encoder"]
+    predictor = jepa_components["predictor"]
+    encode_frame = jepa_components["encode_frame"]
+
+    frame_t = prepare_jepa_frames(jepa_batch["current_image"], device)
+    frame_tH = prepare_jepa_frames(jepa_batch["future_image"], device)
+    state = jepa_batch["state"].to(device, dtype=torch.float32)
+    action_chunk = action_chunk.to(device, dtype=torch.float32)
+
+    with torch.no_grad():
+        z_t = F.layer_norm(encode_frame(encoder, frame_t, device), [1024])
+        z_tH = F.layer_norm(encode_frame(encoder, frame_tH, device), [1024])
+
+    action_flat = action_chunk.reshape(action_chunk.shape[0], -1).unsqueeze(1)
+    state_in = state.unsqueeze(1)
+    action_flat = F.layer_norm(action_flat, action_flat.shape[-1:])
+    state_in = F.layer_norm(state_in, state_in.shape[-1:])
+    z_pred = predictor(z_t, action_flat, state_in)
+    return torch.mean(torch.abs(z_pred - z_tH))
 
 
 def train_loop(config: _config.TrainConfig):
@@ -457,15 +599,30 @@ def train_loop(config: _config.TrainConfig):
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
+    if config.pytorch_freeze_paligemma or config.jepa_loss_weight > 0:
+        freeze_paligemma_for_joint_training(model)
+
+    jepa_components = setup_jepa_components(config, device)
+    extra_modules = None
+    if jepa_components is not None:
+        extra_modules = {"jepa_predictor": jepa_components["predictor"]}
+        logging.info(
+            f"Enabled V-JEPA joint loss: lambda={config.jepa_loss_weight}, anneal_steps={config.jepa_action_anneal_steps}"
+        )
+
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
+    optim_params = [p for p in get_model_parameters(model) if p.requires_grad]
+    if jepa_components is not None:
+        optim_params.extend(p for p in jepa_components["predictor"].parameters() if p.requires_grad)
+
     # Create optimizer with config parameters
     optim = torch.optim.AdamW(
-        model.parameters(),
+        optim_params,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -475,7 +632,7 @@ def train_loop(config: _config.TrainConfig):
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
+        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device, extra_modules=extra_modules)
         logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
@@ -520,10 +677,18 @@ def train_loop(config: _config.TrainConfig):
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
-        for observation, actions in loader:
+        for batch in loader:
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
+
+            if len(batch) == 2:
+                observation, actions = batch
+                jepa_batch = None
+            elif len(batch) == 3:
+                observation, actions, jepa_batch = batch
+            else:
+                raise ValueError(f"Unexpected batch structure with {len(batch)} entries.")
 
             # The unified data loader returns (observation, actions) tuple
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
@@ -535,14 +700,30 @@ def train_loop(config: _config.TrainConfig):
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass
-            losses = model(observation, actions)
+            use_jepa = jepa_components is not None and jepa_batch is not None
+            model_out = model(observation, actions, return_action_pred=use_jepa)
+            if use_jepa:
+                losses, action_pred_norm = model_out
+            else:
+                losses = model_out
+                action_pred_norm = None
+
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
             elif not isinstance(losses, torch.Tensor):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            loss = losses.mean()
+            flow_loss = losses.mean()
+            jepa_loss = None
+            if use_jepa:
+                pred_weight = min(1.0, global_step / max(1, config.jepa_action_anneal_steps))
+                action_for_jepa_norm = (1.0 - pred_weight) * actions.detach() + pred_weight * action_pred_norm
+                action_for_jepa = unnormalize_actions_for_jepa(action_for_jepa_norm, data_config, config.jepa_action_dim)
+                jepa_loss = compute_jepa_loss(jepa_components, jepa_batch, action_for_jepa, device)
+                loss = flow_loss + config.jepa_loss_weight * jepa_loss
+            else:
+                loss = flow_loss
 
             # Backward pass
             loss.backward()
@@ -552,7 +733,7 @@ def train_loop(config: _config.TrainConfig):
                 log_memory_usage(device, global_step, "after_backward")
 
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(optim_params, max_norm=config.optimizer.clip_gradient_norm)
 
             # Optimizer step
             optim.step()
@@ -569,17 +750,25 @@ def train_loop(config: _config.TrainConfig):
                 infos.append(
                     {
                         "loss": loss.item(),
+                        "flow_loss": flow_loss.item(),
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                     }
                 )
+                if jepa_loss is not None:
+                    infos[-1]["jepa_loss"] = jepa_loss.item()
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
 
                 # Average stats over log interval
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
+                avg_flow_loss = sum(info["flow_loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
+                avg_jepa_loss = None
+                if any("jepa_loss" in info for info in infos):
+                    vals = [info["jepa_loss"] for info in infos if "jepa_loss" in info]
+                    avg_jepa_loss = sum(vals) / len(vals)
 
                 avg_grad_norm = None
                 if any("grad_norm" in info for info in infos):
@@ -588,20 +777,26 @@ def train_loop(config: _config.TrainConfig):
                     ]
                     if len(vals) > 0:
                         avg_grad_norm = sum(vals) / len(vals)
-                logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                    if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
-                )
+                msg = f"step={global_step} loss={avg_loss:.4f} flow={avg_flow_loss:.4f}"
+                if avg_jepa_loss is not None:
+                    msg += f" jepa={avg_jepa_loss:.4f}"
+                msg += f" lr={avg_lr:.2e}"
+                if avg_grad_norm is not None:
+                    msg += f" grad_norm={avg_grad_norm:.2f}"
+                msg += f" time={elapsed:.1f}s"
+                logging.info(msg)
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
                     log_payload = {
                         "loss": avg_loss,
+                        "flow_loss": avg_flow_loss,
                         "learning_rate": avg_lr,
                         "step": global_step,
                         "time_per_step": elapsed / config.log_interval,
                     }
+                    if avg_jepa_loss is not None:
+                        log_payload["jepa_loss"] = avg_jepa_loss
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
                     wandb.log(log_payload, step=global_step)
@@ -611,7 +806,7 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, extra_modules=extra_modules)
 
             # Update progress bar
             if pbar is not None:

@@ -148,6 +148,9 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         fine_grained_level=data_config.fine_grained_level,
         return_seg_instance=data_config.return_seg_instance,
         train_rgb_type=data_config.train_rgb_type,
+        return_jepa_fields=data_config.return_jepa_fields,
+        jepa_camera_key=data_config.jepa_camera_key,
+        jepa_future_delta=data_config.jepa_future_delta,
         **args,
     )
 
@@ -460,4 +463,9 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            jepa = batch.pop("jepa", None)
+            observation = _model.Observation.from_dict(batch)
+            if jepa is None:
+                yield observation, batch["actions"]
+            else:
+                yield observation, batch["actions"], jepa

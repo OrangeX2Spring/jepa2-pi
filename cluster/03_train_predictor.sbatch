@@ -4,6 +4,7 @@
 #SBATCH --qos=students_normal
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
+#SBATCH --mem=48G
 #SBATCH --output=/mnt/projects/at3dcv/world_model/logs/train_%j.out
 #SBATCH --error=/mnt/projects/at3dcv/world_model/logs/train_%j.err
 

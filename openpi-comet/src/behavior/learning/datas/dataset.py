@@ -89,6 +89,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         train_rgb_type: str = "regular",  # regular | bbox | point
         return_seg_instance: bool = False,
         skill_list: list[str] = ["all"],
+        return_jepa_fields: bool = False,
+        jepa_camera_key: str = "observation.images.rgb.head",
+        jepa_future_delta: int = 32,
     ):
         """
         Custom args:
@@ -133,6 +136,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.return_seg_instance = return_seg_instance
         self.train_rgb_type = train_rgb_type
         self.skill_list = skill_list
+        self.return_jepa_fields = return_jepa_fields
+        self.jepa_camera_key = jepa_camera_key
+        self.jepa_future_delta = jepa_future_delta
 
         # Unused attributes
         self.image_writer = None
@@ -450,6 +456,25 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             image_keys = self.meta.camera_keys
             for cam in image_keys:
                 item[cam] = self.image_transforms(item[cam])
+
+        if self.return_jepa_fields:
+            if self.jepa_camera_key not in item:
+                raise KeyError(f"JEPA camera key {self.jepa_camera_key!r} is not present in loaded item.")
+
+            ep_pos = self.episode_data_index_pos[ep_idx]
+            ep_start = self.episode_data_index["from"][ep_pos].item()
+            ep_end = self.episode_data_index["to"][ep_pos].item()
+            future_idx = min(ep_end - 1, self.current_streaming_frame_idx + self.jepa_future_delta)
+            future_local_idx = future_idx - ep_start
+            future_ts = future_local_idx / self.fps
+            future_image = self._query_videos({self.jepa_camera_key: [future_ts]}, ep_idx)[self.jepa_camera_key]
+
+            item["jepa"] = {
+                "current_image": item[self.jepa_camera_key],
+                "future_image": future_image,
+                "state": item["observation.state"],
+                "actions": item["action"],
+            }
 
         # Add task as a string
         item["task"] = self._get_fine_grained_task(item)

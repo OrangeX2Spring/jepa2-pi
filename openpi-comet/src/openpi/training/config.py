@@ -133,6 +133,11 @@ class DataConfig:
     # skill list to use for training
     skill_list: list[str] = dataclasses.field(default_factory=lambda: ["all"])
 
+    # Optional fields used by V-JEPA joint training.
+    return_jepa_fields: bool = False
+    jepa_camera_key: str = "observation.images.rgb.head"
+    jepa_future_delta: int = 32
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -288,18 +293,27 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # Make inputs look like they come from the Libero environment
+        repack_structure = {
+            "observation/egocentric_camera": "observation.images.rgb.head",
+            "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+            "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        if self.base_config is not None and self.base_config.return_jepa_fields:
+            repack_structure.update(
+                {
+                    "jepa/current_image": "jepa/current_image",
+                    "jepa/future_image": "jepa/future_image",
+                    "jepa/state": "jepa/state",
+                    "jepa/actions": "jepa/actions",
+                }
+            )
+
         repack_transform = _transforms.Group(
             inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/egocentric_camera": "observation.images.rgb.head",
-                        "observation/wrist_image_left": "observation.images.rgb.left_wrist",
-                        "observation/wrist_image_right": "observation.images.rgb.right_wrist",
-                        "observation/state": "observation.state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                    }
-                )
+                _transforms.RepackTransform(repack_structure)
             ]
         )
 
@@ -515,6 +529,16 @@ class TrainConfig:
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
+
+    # V-JEPA 2-AC joint-training options. Disabled when jepa_loss_weight == 0.
+    jepa_loss_weight: float = 0.0
+    jepa_vjepa2_root: str | None = None
+    jepa_encoder_ckpt: str | None = None
+    jepa_predictor_ckpt: str | None = None
+    jepa_predictor_config: str = "app/vjepa_behavior/configs/vitl-256-b1k.yaml"
+    jepa_action_anneal_steps: int = 5000
+    jepa_action_dim: int = 23
+    pytorch_freeze_paligemma: bool = False
 
     # Learning rate schedule to use for training.
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
@@ -800,6 +824,43 @@ _CONFIGS = [
         checkpoint_base_dir=".",
         num_workers=8,
         batch_size=8 * 32,
+    ),
+    # 3b. Joint PI0.5 + V-JEPA 2-AC alignment
+    TrainConfig(
+        name="pi05_b1k-jepa_joint",
+        exp_name="pi05-b1k-jepa-joint",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="/tmp/b1k_data",
+                fine_grained_level=0,
+                return_jepa_fields=True,
+                jepa_camera_key="observation.images.rgb.head",
+                jepa_future_delta=32,
+            ),
+        ),
+        num_train_steps=20_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-6,
+            decay_steps=20_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="/mnt/projects/at3dcv/world_model/ckpt_joint",
+        num_workers=2,
+        batch_size=8,
+        jepa_loss_weight=0.05,
+        jepa_vjepa2_root="/mnt/projects/at3dcv/world_model/jepa2-pi/vjepa2",
+        jepa_encoder_ckpt="/mnt/projects/at3dcv/world_model/vjepa2_vitl.pt",
+        jepa_predictor_ckpt="/mnt/projects/at3dcv/world_model/ckpt_predictor/latest.pt",
+        jepa_predictor_config="app/vjepa_behavior/configs/vitl-256-b1k.yaml",
+        jepa_action_anneal_steps=5000,
+        pytorch_freeze_paligemma=True,
+        wandb_enabled=True,
     ),
     # 4. Multi-dataset Training Configs
     TrainConfig(

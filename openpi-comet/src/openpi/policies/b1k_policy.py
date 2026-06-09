@@ -157,6 +157,9 @@ class B1kInputs(transforms.DataTransformFn):
         if "actions" in data:
             inputs["actions"] = action
 
+        if "jepa" in data:
+            inputs["jepa"] = data["jepa"]
+
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
