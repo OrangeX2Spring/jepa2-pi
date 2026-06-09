@@ -102,7 +102,8 @@ class BehaviorDataset(Dataset):
 
             # Derive expected video path from parquet path
             rel = Path(pq).relative_to(self.data_root / "data")
-            video_path = self.data_root / "videos" / self.camera_key / rel.with_suffix(".mp4")
+            rel_mp4 = rel.with_suffix(".mp4")
+            video_path = self.data_root / "videos" / rel_mp4.parent / self.camera_key / rel_mp4.name
 
             if not video_path.exists():
                 # Tolerate missing video — skip episode with a warning

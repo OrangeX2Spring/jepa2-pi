@@ -4,18 +4,18 @@
 #SBATCH --qos=students_normal
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --output=/mnt/home/chunquancheng/logs/train_%j.out
-#SBATCH --error=/mnt/home/chunquancheng/logs/train_%j.err
+#SBATCH --output=/mnt/projects/at3dcv/world_model/logs/train_%j.out
+#SBATCH --error=/mnt/projects/at3dcv/world_model/logs/train_%j.err
 
 # Resubmit this script as many times as needed — training resumes automatically
 # from the latest checkpoint each time. Stop when the loss curve flattens.
 
 set -e
-mkdir -p /mnt/home/chunquancheng/logs
-mkdir -p /mnt/home/chunquancheng/ckpt_predictor
+mkdir -p /mnt/projects/at3dcv/world_model/logs
+mkdir -p /mnt/projects/at3dcv/world_model/ckpt_predictor
 
-REPO=/mnt/home/chunquancheng/jepa2-pi
-IMAGE=/mnt/home/chunquancheng/jepa2-pi.tar
+REPO=/mnt/projects/at3dcv/world_model/jepa2-pi
+IMAGE=/mnt/projects/at3dcv/world_model/jepa2-pi.tar
 
 # ── 1. Load container image ──────────────────────────────────────────────────
 echo "Loading container..."
@@ -25,7 +25,7 @@ podman load -i $IMAGE
 # Training is I/O-bound on shard reads; local SSD is much faster than NFS.
 echo "Copying latent shards to /tmp..."
 mkdir -p /tmp/latents
-cp /mnt/home/chunquancheng/latents/*.tar /tmp/latents/
+cp /mnt/projects/at3dcv/world_model/latents/*.tar /tmp/latents/
 echo "Shards ready: $(ls /tmp/latents/*.tar | wc -l) files"
 
 # ── 3. Run Stage 1b: train predictor ─────────────────────────────────────────
@@ -43,7 +43,7 @@ podman run --rm \
     jepa2-pi \
     python -m app.vjepa_behavior.train_predictor \
         --latent_dir /tmp/latents \
-        --ckpt_dir   /mnt/home/chunquancheng/ckpt_predictor \
+        --ckpt_dir   /mnt/projects/at3dcv/world_model/ckpt_predictor \
         --config     app/vjepa_behavior/configs/vitl-256-b1k.yaml
 
-echo "Job finished. Check /mnt/home/chunquancheng/ckpt_predictor/ for checkpoints."
+echo "Job finished. Check /mnt/projects/at3dcv/world_model/ckpt_predictor/ for checkpoints."
