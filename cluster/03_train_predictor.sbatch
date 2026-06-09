@@ -40,7 +40,7 @@ podman run --rm \
     -w $REPO/vjepa2 \
     --device=nvidia.com/gpu=all \
     -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES \
-    -e DECORD_EOF_RETRY_MAX=20480 \
+    -e DECORD_EOF_RETRY_MAX=512 \
     --network=host \
     --ipc=host \
     jepa2-pi \

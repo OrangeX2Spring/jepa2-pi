@@ -4,7 +4,7 @@ BEHAVIOR-1K dataset for Stage-1 AC predictor training.
 Expected data layout (LeRobot / HuggingFace format):
   <data_root>/
     data/
-      chunk-000/episode_000000.parquet   (columns: observation.state [23],
+      chunk-000/episode_000000.parquet   (columns: observation.state [256],
                                                     action [23],
                                                     episode_index, frame_index)
       chunk-000/episode_000001.parquet
@@ -20,7 +20,7 @@ If your data is arranged differently, adjust _discover_episodes() below.
 Returns per sample:
     frame_t     FloatTensor [3, H, W]   normalised RGB at step t
     action      FloatTensor [chunk, 23] action chunk starting at t
-    state       FloatTensor [23]        proprio at t
+    state       FloatTensor [256]       proprio at t
     frame_tH    FloatTensor [3, H, W]   normalised RGB at step t+chunk
 """
 

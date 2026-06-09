@@ -114,7 +114,7 @@ def infinite_loader(latent_dir: str, batch_size: int):
         yield from make_loader(latent_dir, batch_size)
 
 
-def make_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256, num_workers=4):
+def make_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256, num_workers=2):
     dataset = BehaviorDataset(data_root=data_root, camera_key=camera_key,
                                chunk_len=chunk_len, img_size=img_size)
     print(f"Live dataset: {len(dataset)} samples")
@@ -122,9 +122,9 @@ def make_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=2
                       num_workers=num_workers, pin_memory=True, drop_last=True)
 
 def infinite_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256):
+    loader = make_live_loader(data_root, camera_key, batch_size, chunk_len, img_size)
     while True:
-        for frame_t, action, state, frame_tH in make_live_loader(
-                data_root, camera_key, batch_size, chunk_len, img_size):
+        for frame_t, action, state, frame_tH in loader:
             yield frame_t, frame_tH, action, state  # reorder to match (z_t, z_tH, action, state)
 
 # ------------------------------------------------------------------
@@ -135,7 +135,7 @@ def loss_fn(z_pred: torch.Tensor, z_target: torch.Tensor) -> torch.Tensor:
 def forward_step(predictor, z_t, action_chunk, state_t):
     B = z_t.size(0)
     action_flat = action_chunk.reshape(B, FLAT_ACTION).unsqueeze(1)  # [B, 1, 736]
-    state_in    = state_t.unsqueeze(1)                                # [B, 1, 23]
+    state_in    = state_t.unsqueeze(1)                                # [B, 1, 256]
     # Layer-norm before encoders: handles mixed units (velocities, angles, [0,1] gripper)
     action_flat = F.layer_norm(action_flat, action_flat.shape[-1:])
     state_in    = F.layer_norm(state_in,    state_in.shape[-1:])
