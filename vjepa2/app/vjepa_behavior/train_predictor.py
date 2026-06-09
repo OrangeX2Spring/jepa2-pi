@@ -83,7 +83,10 @@ def build_predictor(cfg: dict, device: torch.device):
 
 
 # ------------------------------------------------------------------
-def make_loader(latent_dir: str, batch_size: int, shuffle_buffer: int = 5000):
+def make_loader(latent_dir: str, batch_size: int, shuffle_buffer: int = 1000,
+                num_workers: int = 4):
+    # NB: the shuffle buffer holds raw ~1 MB samples *per worker* —
+    # buffer 1000 × 4 workers ≈ 4 GB CPU RAM. Keep it modest on 24 GB nodes.
     shards = sorted([
         os.path.join(latent_dir, f)
         for f in os.listdir(latent_dir)
@@ -105,13 +108,13 @@ def make_loader(latent_dir: str, batch_size: int, shuffle_buffer: int = 5000):
         .map(decode_sample)
         .batched(batch_size, partial=False)
     )
-    return wds.WebLoader(dataset, batch_size=None, num_workers=4, pin_memory=True)
+    return wds.WebLoader(dataset, batch_size=None, num_workers=num_workers, pin_memory=True)
 
 
-def infinite_loader(latent_dir: str, batch_size: int):
+def infinite_loader(latent_dir: str, batch_size: int, num_workers: int = 4):
     """Yields batches indefinitely, restarting when the dataset is exhausted."""
     while True:
-        yield from make_loader(latent_dir, batch_size)
+        yield from make_loader(latent_dir, batch_size, num_workers=num_workers)
 
 
 def make_live_loader(
@@ -179,13 +182,14 @@ def forward_step(predictor, z_t, action_chunk, state_t):
 
 
 # ------------------------------------------------------------------
-def save_checkpoint(path, predictor, optimizer, scheduler, step, loss):
+def save_checkpoint(path, predictor, optimizer, scheduler, scaler, step, loss):
     """Full checkpoint for resuming training (model + optimizer + scheduler)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save({
         "predictor": predictor.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
+        "scaler":    scaler.state_dict(),
         "step":      step,
         "loss":      loss,
     }, path)
@@ -201,11 +205,13 @@ def save_snapshot(path, predictor, step, loss):
     }, path)
 
 
-def load_checkpoint(path, predictor, optimizer, scheduler):
+def load_checkpoint(path, predictor, optimizer, scheduler, scaler):
     ckpt = torch.load(path, map_location="cpu")
     predictor.load_state_dict(ckpt["predictor"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
+    if "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
     print(f"Resumed from step {ckpt['step']}  (loss={ckpt['loss']:.4f})")
     return ckpt["step"]
 
@@ -245,13 +251,14 @@ def train(args, cfg):
         min_lr    = min_lr,
     )
 
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+
     # Auto-resume
     start_step = 0
     latest = os.path.join(args.ckpt_dir, "latest.pt")
     if os.path.isfile(latest):
-        start_step = load_checkpoint(latest, predictor, optimizer, scheduler)
+        start_step = load_checkpoint(latest, predictor, optimizer, scheduler, scaler)
 
-    scaler   = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     if args.data_root:
         data_gen = infinite_live_loader(args.data_root, args.camera_key,
                                         batch_size, CHUNK_LEN,
@@ -264,7 +271,8 @@ def train(args, cfg):
                                         shuffle=args.shuffle_live,
                                         sample_stride=args.sample_stride)
     else:
-        data_gen = infinite_loader(args.latent_dir, batch_size)
+        data_gen = infinite_loader(args.latent_dir, batch_size,
+                                   num_workers=args.num_workers)
     recent_losses = []
     t0 = time.time()
     step = start_step
@@ -345,7 +353,7 @@ def train(args, cfg):
 
         # Periodic latest checkpoint (safe to lose at most save_every steps)
         if step % save_every == 0:
-            save_checkpoint(latest, predictor, optimizer, scheduler, step, loss.item())
+            save_checkpoint(latest, predictor, optimizer, scheduler, scaler, step, loss.item())
             print(f"  [ckpt] step {step} -> {latest}")
 
         # Permanent snapshot — weights only (lightweight, for evaluation)
@@ -358,7 +366,7 @@ def train(args, cfg):
         current_lr = optimizer.param_groups[0]["lr"]
         if current_lr <= min_lr and step > lr_patience_steps:
             print(f"LR reached min_lr ({current_lr:.2e}) at step {step} — converged.")
-            save_checkpoint(latest, predictor, optimizer, scheduler, step, loss.item())
+            save_checkpoint(latest, predictor, optimizer, scheduler, scaler, step, loss.item())
             snap = os.path.join(args.ckpt_dir, f"step_{step:06d}_final.pt")
             save_snapshot(snap, predictor, step, loss.item())
             print(f"Final snapshot saved: {snap}")

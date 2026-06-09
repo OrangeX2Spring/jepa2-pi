@@ -15,7 +15,10 @@ Output per sample (inside each tar shard):
 
 Storage estimate (ViT-L, 256px):
     256 tokens × 1024 dim × 2 bytes × 2 frames = ~1 MB / sample
-    100k samples ≈ 100 GB  →  keep within cluster 250 GB quota.
+    100k samples ≈ 100 GB  →  too big for the 250 GB network quota, so write
+    shards to the node-local /tmp SSD (900 GB, wiped at job end) and re-encode
+    once per job. With --sample_stride 8 --max_episodes_per_task 200 it is
+    ~25k samples ≈ ~25 GB.
 
 Usage:
     python -m app.vjepa_behavior.encode_latents \
@@ -176,6 +179,12 @@ def main():
     parser.add_argument("--num_workers",  type=int, default=4)
     parser.add_argument("--chunk_len",    type=int, default=32)
     parser.add_argument("--img_size",     type=int, default=256)
+    parser.add_argument("--max_episodes_per_task", type=int, default=None,
+                        help="Cap episodes per task. Must match the training run.")
+    parser.add_argument("--sample_stride", type=int, default=1,
+                        help="Use every Nth valid sample. Must match the training run.")
+    parser.add_argument("--video_cache_size",   type=int, default=1)
+    parser.add_argument("--episode_cache_size", type=int, default=1)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -189,6 +198,10 @@ def main():
         chunk_len=args.chunk_len,
         img_size=args.img_size,
         task_ids=args.task_ids,
+        max_episodes_per_task=args.max_episodes_per_task,
+        sample_stride=args.sample_stride,
+        video_cache_size=args.video_cache_size,
+        episode_cache_size=args.episode_cache_size,
     )
     print(f"Dataset: {len(dataset)} samples")
 

@@ -35,7 +35,6 @@ import pandas as pd
 import pyarrow.parquet as parquet
 import torch
 from torch.utils.data import Dataset
-from torchvision import transforms
 
 # ImageNet normalisation (same as vjepa2 pre-training)
 _MEAN = (0.485, 0.456, 0.406)
@@ -77,12 +76,8 @@ class BehaviorDataset(Dataset):
         self.episode_cache_size = max(0, episode_cache_size)
         self.sample_stride = max(1, sample_stride)
 
-        self.transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=_MEAN, std=_STD),
-        ])
+        self._mean = torch.tensor(_MEAN).view(3, 1, 1)
+        self._std  = torch.tensor(_STD).view(3, 1, 1)
 
         self._episodes = self._discover_episodes(task_ids, max_episodes_per_task)
         self._offsets  = self._build_offsets()
@@ -190,6 +185,15 @@ class BehaviorDataset(Dataset):
 
         return states, actions
 
+    def _normalise(self, frame: np.ndarray) -> torch.Tensor:
+        t = torch.from_numpy(np.ascontiguousarray(frame)).permute(2, 0, 1).float().div_(255.0)
+        if t.shape[-2:] != (self.img_size, self.img_size):
+            t = torch.nn.functional.interpolate(
+                t.unsqueeze(0), size=(self.img_size, self.img_size),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0)
+        return (t - self._mean) / self._std
+
     # ------------------------------------------------------------------
     def __len__(self):
         return self._num_samples
@@ -202,7 +206,10 @@ class BehaviorDataset(Dataset):
         try:
             vpath = ep["video_path"]
             if vpath not in self._vr_cache:
-                vr = decord.VideoReader(vpath, ctx=decord.cpu(0))
+                # Decode directly at the target resolution: ffmpeg's scaler is
+                # far cheaper than decoding full-res and resizing afterwards.
+                vr = decord.VideoReader(vpath, ctx=decord.cpu(0),
+                                        width=self.img_size, height=self.img_size)
                 if self.video_cache_size > 0:
                     self._vr_cache[vpath] = vr
                     while len(self._vr_cache) > self.video_cache_size:
@@ -216,8 +223,8 @@ class BehaviorDataset(Dataset):
             dummy  = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
             frames = np.stack([dummy, dummy])
 
-        frame_t  = self.transform(frames[0])
-        frame_tH = self.transform(frames[1])
+        frame_t  = self._normalise(frames[0])
+        frame_tH = self._normalise(frames[1])
 
         states, actions = self._load_episode_arrays(ep_idx)
         action_chunk = torch.from_numpy(actions[t : t + self.chunk_len])  # [32, 23]
