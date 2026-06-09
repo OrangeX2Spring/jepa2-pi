@@ -25,11 +25,14 @@ Returns per sample:
 
 import glob
 import warnings
+from bisect import bisect_right
+from collections import OrderedDict
 from pathlib import Path
 
 import decord
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as parquet
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -38,7 +41,8 @@ from torchvision import transforms
 _MEAN = (0.485, 0.456, 0.406)
 _STD  = (0.229, 0.224, 0.225)
 
-_VR_CACHE_MAX = 500   # VideoReader objects per worker; each holds ~1-5 MB of video index
+_VR_CACHE_MAX = 32
+_EPISODE_CACHE_MAX = 32
 
 
 class BehaviorDataset(Dataset):
@@ -61,11 +65,15 @@ class BehaviorDataset(Dataset):
         img_size: int = 256,
         task_ids=None,
         max_episodes_per_task: int = None,
+        video_cache_size: int = _VR_CACHE_MAX,
+        episode_cache_size: int = _EPISODE_CACHE_MAX,
     ):
         self.data_root  = Path(data_root)
         self.camera_key = camera_key
         self.chunk_len  = chunk_len
         self.img_size   = img_size
+        self.video_cache_size = max(0, video_cache_size)
+        self.episode_cache_size = max(0, episode_cache_size)
 
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
@@ -75,11 +83,13 @@ class BehaviorDataset(Dataset):
         ])
 
         self._episodes = self._discover_episodes(task_ids, max_episodes_per_task)
-        self._index    = self._build_index()
+        self._offsets  = self._build_offsets()
+        self._num_samples = self._offsets[-1]
 
-        # Per-worker VideoReader cache — populated after DataLoader forks workers.
-        # Avoids re-opening the same MP4 file on every __getitem__ call.
-        self._vr_cache: dict = {}
+        # Per-worker caches populated after DataLoader forks workers. Keeping
+        # these bounded is important on the 24 GB Slurm nodes.
+        self._vr_cache: OrderedDict[str, decord.VideoReader] = OrderedDict()
+        self._episode_cache: OrderedDict[int, tuple[np.ndarray, np.ndarray]] = OrderedDict()
 
     # ------------------------------------------------------------------
     def _discover_episodes(self, task_ids, max_episodes_per_task):
@@ -95,13 +105,21 @@ class BehaviorDataset(Dataset):
         episodes = []
         task_counts: dict = {}   # task_key -> episode count (for per-task cap)
 
-        for pq in parquet_files:
-            df = pd.read_parquet(pq)
+        task_id_set = set(task_ids) if task_ids is not None else None
 
-            if task_ids is not None and "task_index" in df.columns:
-                df = df[df["task_index"].isin(task_ids)]
-                if df.empty:
+        for pq in parquet_files:
+            parquet_file = parquet.ParquetFile(pq)
+            length = parquet_file.metadata.num_rows
+            filter_task_ids = None
+
+            if task_id_set is not None and "task_index" in parquet_file.schema_arrow.names:
+                task_index = pd.read_parquet(pq, columns=["task_index"])["task_index"]
+                mask = task_index.isin(task_id_set)
+                if not mask.any():
                     continue
+                if not mask.all():
+                    length = int(mask.sum())
+                    filter_task_ids = tuple(task_id_set)
 
             # Per-task cap: derive a stable task key from the parquet directory name
             task_key = Path(pq).parent.name
@@ -119,46 +137,76 @@ class BehaviorDataset(Dataset):
                 warnings.warn(f"Video not found, skipping: {video_path}")
                 continue
 
-            states  = np.stack(df["observation.state"].values).astype(np.float32)  # [T, 256]
-            actions = np.stack(df["action"].values).astype(np.float32)              # [T, 23]
-
             episodes.append({
-                "states":     states,
-                "actions":    actions,
+                "parquet_path": pq,
                 "video_path": str(video_path),
-                "length":     len(df),
+                "length":     length,
+                "task_ids":   filter_task_ids,
             })
 
         if not episodes:
             raise RuntimeError("No valid episodes found — check task_ids and video paths.")
         return episodes
 
-    def _build_index(self):
-        index = []
-        for ep_idx, ep in enumerate(self._episodes):
-            for t in range(ep["length"] - self.chunk_len):
-                index.append((ep_idx, t))
-        return index
+    def _build_offsets(self):
+        offsets = [0]
+        for ep in self._episodes:
+            offsets.append(offsets[-1] + max(0, ep["length"] - self.chunk_len))
+        return offsets
+
+    def _lookup_index(self, idx):
+        if idx < 0:
+            idx += self._num_samples
+        if idx < 0 or idx >= self._num_samples:
+            raise IndexError(idx)
+
+        ep_idx = bisect_right(self._offsets, idx) - 1
+        t = idx - self._offsets[ep_idx]
+        return ep_idx, t
+
+    def _load_episode_arrays(self, ep_idx):
+        if ep_idx in self._episode_cache:
+            self._episode_cache.move_to_end(ep_idx)
+            return self._episode_cache[ep_idx]
+
+        ep = self._episodes[ep_idx]
+        columns = ["observation.state", "action"]
+        if ep.get("task_ids") is not None:
+            columns.append("task_index")
+        df = pd.read_parquet(ep["parquet_path"], columns=columns)
+        if ep.get("task_ids") is not None:
+            df = df[df["task_index"].isin(ep["task_ids"])]
+        states = np.stack(df["observation.state"].values).astype(np.float32)
+        actions = np.stack(df["action"].values).astype(np.float32)
+
+        if self.episode_cache_size > 0:
+            self._episode_cache[ep_idx] = (states, actions)
+            self._episode_cache.move_to_end(ep_idx)
+            while len(self._episode_cache) > self.episode_cache_size:
+                self._episode_cache.popitem(last=False)
+
+        return states, actions
 
     # ------------------------------------------------------------------
     def __len__(self):
-        return len(self._index)
+        return self._num_samples
 
     def __getitem__(self, idx):
-        ep_idx, t = self._index[idx]
+        ep_idx, t = self._lookup_index(idx)
         ep = self._episodes[ep_idx]
         tH = t + self.chunk_len
 
         try:
             vpath = ep["video_path"]
             if vpath not in self._vr_cache:
-                # Evict oldest half when cache is full (dict preserves insertion order)
-                if len(self._vr_cache) >= _VR_CACHE_MAX:
-                    for k in list(self._vr_cache.keys())[: _VR_CACHE_MAX // 2]:
-                        del self._vr_cache[k]
-                self._vr_cache[vpath] = decord.VideoReader(vpath, ctx=decord.cpu(0))
-
-            vr = self._vr_cache[vpath]
+                vr = decord.VideoReader(vpath, ctx=decord.cpu(0))
+                if self.video_cache_size > 0:
+                    self._vr_cache[vpath] = vr
+                    while len(self._vr_cache) > self.video_cache_size:
+                        self._vr_cache.popitem(last=False)
+            else:
+                self._vr_cache.move_to_end(vpath)
+                vr = self._vr_cache[vpath]
             tH_clamped = min(tH, len(vr) - 1)
             frames = vr.get_batch([t, tH_clamped]).asnumpy()
         except Exception:
@@ -168,7 +216,8 @@ class BehaviorDataset(Dataset):
         frame_t  = self.transform(frames[0])
         frame_tH = self.transform(frames[1])
 
-        action_chunk = torch.from_numpy(ep["actions"][t : t + self.chunk_len])  # [32, 23]
-        state_t      = torch.from_numpy(ep["states"][t])                         # [256]
+        states, actions = self._load_episode_arrays(ep_idx)
+        action_chunk = torch.from_numpy(actions[t : t + self.chunk_len])  # [32, 23]
+        state_t      = torch.from_numpy(states[t])                         # [256]
 
         return frame_t, action_chunk, state_t, frame_tH

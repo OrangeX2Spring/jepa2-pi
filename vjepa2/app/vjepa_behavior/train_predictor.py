@@ -114,20 +114,46 @@ def infinite_loader(latent_dir: str, batch_size: int):
         yield from make_loader(latent_dir, batch_size)
 
 
-def make_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256,
-                     num_workers=4, max_episodes_per_task=None):
+def make_live_loader(
+    data_root,
+    camera_key,
+    batch_size,
+    chunk_len=32,
+    img_size=256,
+    num_workers=4,
+    max_episodes_per_task=None,
+    prefetch_factor=1,
+    video_cache_size=32,
+    episode_cache_size=32,
+):
     dataset = BehaviorDataset(data_root=data_root, camera_key=camera_key,
                                chunk_len=chunk_len, img_size=img_size,
-                               max_episodes_per_task=max_episodes_per_task)
+                               max_episodes_per_task=max_episodes_per_task,
+                               video_cache_size=video_cache_size,
+                               episode_cache_size=episode_cache_size)
     print(f"Live dataset: {len(dataset)} samples ({len(dataset._episodes)} episodes)")
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                      num_workers=num_workers, pin_memory=True, drop_last=True,
-                      persistent_workers=(num_workers > 0))
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": True,
+        "num_workers": num_workers,
+        "pin_memory": True,
+        "drop_last": True,
+        "persistent_workers": (num_workers > 0),
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(dataset, **loader_kwargs)
 
 def infinite_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256,
-                         max_episodes_per_task=None):
+                         max_episodes_per_task=None, num_workers=4,
+                         prefetch_factor=1, video_cache_size=32,
+                         episode_cache_size=32):
     loader = make_live_loader(data_root, camera_key, batch_size, chunk_len, img_size,
-                              max_episodes_per_task=max_episodes_per_task)
+                              num_workers=num_workers,
+                              max_episodes_per_task=max_episodes_per_task,
+                              prefetch_factor=prefetch_factor,
+                              video_cache_size=video_cache_size,
+                              episode_cache_size=episode_cache_size)
     while True:
         for frame_t, action, state, frame_tH in loader:
             yield frame_t, frame_tH, action, state  # reorder to match (z_t, z_tH, action, state)
@@ -222,7 +248,11 @@ def train(args, cfg):
         data_gen = infinite_live_loader(args.data_root, args.camera_key,
                                         opt_cfg["batch_size"], CHUNK_LEN,
                                         cfg["data"]["crop_size"],
-                                        max_episodes_per_task=args.max_episodes_per_task)
+                                        max_episodes_per_task=args.max_episodes_per_task,
+                                        num_workers=args.num_workers,
+                                        prefetch_factor=args.prefetch_factor,
+                                        video_cache_size=args.video_cache_size,
+                                        episode_cache_size=args.episode_cache_size)
     else:
         data_gen = infinite_loader(args.latent_dir, opt_cfg["batch_size"])
     recent_losses = []
@@ -312,6 +342,14 @@ def main():
     parser.add_argument("--max_episodes_per_task", type=int, default=None,
                         help="Cap episodes per task to limit dataset size and RAM. "
                              "None = use all. 200 gives ~200k samples and fast iteration.")
+    parser.add_argument("--num_workers",           type=int, default=4,
+                        help="DataLoader workers for live frame training.")
+    parser.add_argument("--prefetch_factor",       type=int, default=1,
+                        help="Batches prefetched per worker for live frame training.")
+    parser.add_argument("--video_cache_size",      type=int, default=32,
+                        help="Max VideoReader objects cached per worker.")
+    parser.add_argument("--episode_cache_size",    type=int, default=32,
+                        help="Max parquet episodes cached per worker.")
     parser.add_argument("--ckpt_dir",   required=True)
     parser.add_argument("--config",     default="app/vjepa_behavior/configs/vitl-256-b1k.yaml")
     args = parser.parse_args()

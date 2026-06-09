@@ -4,6 +4,8 @@
 #SBATCH --qos=students_normal
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
 #SBATCH --output=/mnt/projects/at3dcv/world_model/logs/train_%j.out
 #SBATCH --error=/mnt/projects/at3dcv/world_model/logs/train_%j.err
 
@@ -50,6 +52,10 @@ podman run --rm \
         --encoder_ckpt          /mnt/projects/at3dcv/world_model/vjepa2_vitl.pt \
         --ckpt_dir              /mnt/projects/at3dcv/world_model/ckpt_predictor \
         --config                app/vjepa_behavior/configs/vitl-256-b1k.yaml \
-        --max_episodes_per_task 200
+        --max_episodes_per_task 200 \
+        --num_workers           4 \
+        --prefetch_factor       1 \
+        --video_cache_size      32 \
+        --episode_cache_size    32
 
 echo "Job finished. Check /mnt/projects/at3dcv/world_model/ckpt_predictor/ for checkpoints."
