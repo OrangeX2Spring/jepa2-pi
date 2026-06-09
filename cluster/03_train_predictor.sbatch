@@ -41,6 +41,7 @@ podman run --rm \
     --device=nvidia.com/gpu=all \
     -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES \
     -e DECORD_EOF_RETRY_MAX=512 \
+    -e PYTHONUNBUFFERED=1 \
     --network=host \
     --ipc=host \
     jepa2-pi \

@@ -114,7 +114,7 @@ def infinite_loader(latent_dir: str, batch_size: int):
         yield from make_loader(latent_dir, batch_size)
 
 
-def make_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256, num_workers=2):
+def make_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256, num_workers=4):
     dataset = BehaviorDataset(data_root=data_root, camera_key=camera_key,
                                chunk_len=chunk_len, img_size=img_size)
     print(f"Live dataset: {len(dataset)} samples")
