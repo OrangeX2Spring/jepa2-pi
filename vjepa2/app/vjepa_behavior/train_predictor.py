@@ -223,6 +223,8 @@ def train(args, cfg):
     log_freq       = meta_cfg.get("log_freq",        100)
     min_lr         = opt_cfg.get("min_lr",           1e-6)
     batch_size     = args.batch_size or opt_cfg["batch_size"]
+    lr_patience_steps = opt_cfg.get("lr_patience", 1000)
+    lr_patience_logs = max(1, lr_patience_steps // log_freq)
 
     predictor = build_predictor(cfg, device)
     predictor.train()
@@ -239,7 +241,7 @@ def train(args, cfg):
         optimizer,
         mode      = "min",
         factor    = opt_cfg.get("lr_decay_factor", 0.5),
-        patience  = opt_cfg.get("lr_patience",     1000),
+        patience  = lr_patience_logs,
         min_lr    = min_lr,
     )
 
@@ -354,7 +356,7 @@ def train(args, cfg):
 
         # Convergence: LR has decayed to the floor — nothing left to learn
         current_lr = optimizer.param_groups[0]["lr"]
-        if current_lr <= min_lr and step > opt_cfg.get("lr_patience", 1000):
+        if current_lr <= min_lr and step > lr_patience_steps:
             print(f"LR reached min_lr ({current_lr:.2e}) at step {step} — converged.")
             save_checkpoint(latest, predictor, optimizer, scheduler, step, loss.item())
             snap = os.path.join(args.ckpt_dir, f"step_{step:06d}_final.pt")

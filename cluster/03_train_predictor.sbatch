@@ -50,7 +50,7 @@ podman run --rm \
         --encoder_ckpt          /mnt/projects/at3dcv/world_model/vjepa2_vitl.pt \
         --ckpt_dir              /mnt/projects/at3dcv/world_model/ckpt_predictor \
         --config                app/vjepa_behavior/configs/vitl-256-b1k.yaml \
-        --batch_size            16 \
+        --batch_size            192 \
         --max_episodes_per_task 200 \
         --num_workers           4 \
         --prefetch_factor       1 \
