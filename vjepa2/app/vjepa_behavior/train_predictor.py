@@ -125,6 +125,7 @@ def make_live_loader(
     prefetch_factor=1,
     video_cache_size=32,
     episode_cache_size=32,
+    shuffle=True,
 ):
     dataset = BehaviorDataset(data_root=data_root, camera_key=camera_key,
                                chunk_len=chunk_len, img_size=img_size,
@@ -134,7 +135,7 @@ def make_live_loader(
     print(f"Live dataset: {len(dataset)} samples ({len(dataset._episodes)} episodes)")
     loader_kwargs = {
         "batch_size": batch_size,
-        "shuffle": True,
+        "shuffle": shuffle,
         "num_workers": num_workers,
         "pin_memory": True,
         "drop_last": True,
@@ -147,13 +148,14 @@ def make_live_loader(
 def infinite_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256,
                          max_episodes_per_task=None, num_workers=4,
                          prefetch_factor=1, video_cache_size=32,
-                         episode_cache_size=32):
+                         episode_cache_size=32, shuffle=True):
     loader = make_live_loader(data_root, camera_key, batch_size, chunk_len, img_size,
                               num_workers=num_workers,
                               max_episodes_per_task=max_episodes_per_task,
                               prefetch_factor=prefetch_factor,
                               video_cache_size=video_cache_size,
-                              episode_cache_size=episode_cache_size)
+                              episode_cache_size=episode_cache_size,
+                              shuffle=shuffle)
     while True:
         for frame_t, action, state, frame_tH in loader:
             yield frame_t, frame_tH, action, state  # reorder to match (z_t, z_tH, action, state)
@@ -252,7 +254,8 @@ def train(args, cfg):
                                         num_workers=args.num_workers,
                                         prefetch_factor=args.prefetch_factor,
                                         video_cache_size=args.video_cache_size,
-                                        episode_cache_size=args.episode_cache_size)
+                                        episode_cache_size=args.episode_cache_size,
+                                        shuffle=args.shuffle_live)
     else:
         data_gen = infinite_loader(args.latent_dir, opt_cfg["batch_size"])
     recent_losses = []
@@ -350,6 +353,8 @@ def main():
                         help="Max VideoReader objects cached per worker.")
     parser.add_argument("--episode_cache_size",    type=int, default=32,
                         help="Max parquet episodes cached per worker.")
+    parser.add_argument("--shuffle_live",          action=argparse.BooleanOptionalAction, default=True,
+                        help="Shuffle live frame samples. Disable for low-memory sequential video reads.")
     parser.add_argument("--ckpt_dir",   required=True)
     parser.add_argument("--config",     default="app/vjepa_behavior/configs/vitl-256-b1k.yaml")
     args = parser.parse_args()
