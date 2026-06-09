@@ -43,12 +43,15 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from src.models.ac_predictor import vit_ac_predictor
+from torch.utils.data import DataLoader
+from app.vjepa_behavior.dataset import BehaviorDataset
+from app.vjepa_behavior.encode_latents import load_encoder, encode_frame
 
 # ------------------------------------------------------------------
 # Constants matching π0.5-comet / R1Pro
 ACTION_DIM       = 23
 CHUNK_LEN        = 32
-STATE_DIM        = 23
+STATE_DIM        = 256
 FLAT_ACTION      = CHUNK_LEN * ACTION_DIM   # 736 — fed as a single token per frame
 ENCODER_DIM      = 1024
 TOKENS_PER_FRAME = 256                      # (256px / 16 patch)^2
@@ -110,6 +113,19 @@ def infinite_loader(latent_dir: str, batch_size: int):
     while True:
         yield from make_loader(latent_dir, batch_size)
 
+
+def make_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256, num_workers=4):
+    dataset = BehaviorDataset(data_root=data_root, camera_key=camera_key,
+                               chunk_len=chunk_len, img_size=img_size)
+    print(f"Live dataset: {len(dataset)} samples")
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                      num_workers=num_workers, pin_memory=True, drop_last=True)
+
+def infinite_live_loader(data_root, camera_key, batch_size, chunk_len=32, img_size=256):
+    while True:
+        for frame_t, action, state, frame_tH in make_live_loader(
+                data_root, camera_key, batch_size, chunk_len, img_size):
+            yield frame_t, frame_tH, action, state  # reorder to match (z_t, z_tH, action, state)
 
 # ------------------------------------------------------------------
 def loss_fn(z_pred: torch.Tensor, z_target: torch.Tensor) -> torch.Tensor:
@@ -173,6 +189,7 @@ def train(args, cfg):
 
     predictor = build_predictor(cfg, device)
     predictor.train()
+    encoder = load_encoder(args.encoder_ckpt, device) if args.data_root else None
 
     optimizer = AdamW(
         predictor.parameters(),
@@ -196,7 +213,12 @@ def train(args, cfg):
         start_step = load_checkpoint(latest, predictor, optimizer, scheduler)
 
     scaler   = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
-    data_gen = infinite_loader(args.latent_dir, opt_cfg["batch_size"])
+    if args.data_root:
+        data_gen = infinite_live_loader(args.data_root, args.camera_key,
+                                        opt_cfg["batch_size"], CHUNK_LEN,
+                                        cfg["data"]["crop_size"])
+    else:
+        data_gen = infinite_loader(args.latent_dir, opt_cfg["batch_size"])
     recent_losses = []
     t0 = time.time()
     step = start_step
@@ -206,10 +228,17 @@ def train(args, cfg):
     while True:
         z_t, z_tH, action, state = next(data_gen)
 
-        z_t    = z_t.to(device,    non_blocking=True)
-        z_tH   = z_tH.to(device,   non_blocking=True)
-        action = action.to(device, non_blocking=True)
-        state  = state.to(device,  non_blocking=True)
+        if encoder is not None:
+            z_t, z_tH = z_t.to(device), z_tH.to(device)
+            action, state = action.to(device), state.to(device)
+            with torch.no_grad():
+                z_t  = F.layer_norm(encode_frame(encoder, z_t,  device), [ENCODER_DIM])
+                z_tH = F.layer_norm(encode_frame(encoder, z_tH, device), [ENCODER_DIM])
+        else:
+            z_t    = z_t.to(device,    non_blocking=True)
+            z_tH   = z_tH.to(device,   non_blocking=True)
+            action = action.to(device, non_blocking=True)
+            state  = state.to(device,  non_blocking=True)
 
         with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
             z_pred = forward_step(predictor, z_t, action, state)
@@ -270,7 +299,10 @@ def train(args, cfg):
 # ------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--latent_dir", required=True)
+    parser.add_argument("--latent_dir",   default=None)
+    parser.add_argument("--data_root",    default=None)
+    parser.add_argument("--encoder_ckpt", default="")
+    parser.add_argument("--camera_key",   default="observation.images.rgb.head")
     parser.add_argument("--ckpt_dir",   required=True)
     parser.add_argument("--config",     default="app/vjepa_behavior/configs/vitl-256-b1k.yaml")
     args = parser.parse_args()

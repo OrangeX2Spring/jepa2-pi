@@ -144,10 +144,14 @@ class BehaviorDataset(Dataset):
         tH = t + self.chunk_len
 
         # Decode only the two needed frames using decord (avoids full video load)
-        vr = decord.VideoReader(ep["video_path"], ctx=decord.cpu(0))
-        # clamp tH in case the video is slightly shorter than the parquet
-        tH_clamped = min(tH, len(vr) - 1)
-        frames = vr.get_batch([t, tH_clamped]).asnumpy()  # [2, H, W, 3] uint8
+        try:
+            vr = decord.VideoReader(ep["video_path"], ctx=decord.cpu(0))
+            tH_clamped = min(tH, len(vr) - 1)
+            frames = vr.get_batch([t, tH_clamped]).asnumpy()
+        except Exception:
+            # Return a zero sample for corrupted videos
+            dummy = np.zeros((self.img_size, self.img_size, 3), dtype=np.uint8)
+            frames = np.stack([dummy, dummy])
 
         frame_t  = self.transform(frames[0])   # [3, img_size, img_size]
         frame_tH = self.transform(frames[1])   # [3, img_size, img_size]

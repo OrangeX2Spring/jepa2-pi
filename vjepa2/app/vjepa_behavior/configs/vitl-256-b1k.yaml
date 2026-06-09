@@ -15,7 +15,7 @@ model:
   use_activation_checkpointing: false
 
 optimization:
-  batch_size:      64       # ~14-16 GB GPU mem; above the 12 GB cluster kill threshold
+  batch_size:      128       # ~14-16 GB GPU mem; above the 12 GB cluster kill threshold
   lr:           4.0e-4
   weight_decay:   0.04
   lr_decay_factor: 0.5      # multiply LR by this on plateau
